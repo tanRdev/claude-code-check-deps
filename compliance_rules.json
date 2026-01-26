@@ -1,0 +1,10 @@
+{
+  "blocked_packages": {
+    "moment": "Use date-fns instead (smaller, immutable, tree-shakeable)",
+    "requests": "Use httpx instead (async support, HTTP/2)",
+    "lodash": "Use native ES methods or lodash-es for tree-shaking",
+    "jquery": "Use vanilla JS or a modern framework",
+    "urllib3": "Use httpx instead",
+    "left-pad": "Use String.prototype.padStart()"
+  }
+}
