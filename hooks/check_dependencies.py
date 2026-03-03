@@ -99,9 +99,12 @@ def _normalise_go(token: str) -> list[str]:
 
 
 def _split_command_segments(command: str) -> list[str]:
-    lexer = shlex.shlex(command, posix=True, punctuation_chars="|;&")
-    lexer.whitespace_split = True
-    tokens = list(lexer)
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|;&")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return [command]
 
     segments: list[str] = []
     current: list[str] = []
