@@ -100,6 +100,31 @@ The script should read JSON from stdin with tool_name and tool_input, extract pa
 
 ## How It Works
 
+```mermaid
+flowchart TB
+    subgraph "Claude Code"
+        A[Tool Call] --> B{PreToolUse Hook}
+    end
+    
+    B --> C[check_dependencies.py]
+    C --> D{Tool Type?}
+    
+    D -->|Bash| E[Parse Command]
+    D -->|Write/Edit| F[Scan Imports]
+    
+    E --> G["Extract packages<br/>(npm, pip, go, cargo...)"]
+    F --> H["Extract imports<br/>(Python, JS/TS, Go)"]
+    
+    G --> I{Check against<br/>compliance_rules.json}
+    H --> I
+    
+    I -->|No violations| J["Exit 0<br/>✓ Allow"]
+    I -->|Violations found| K["Exit 2<br/>✗ Block + advice"]
+    
+    J --> L[Tool executes]
+    K --> M[Tool blocked]
+```
+
 **Bash commands**: Splits on `&&`, `||`, `;`, `|`. Detects install managers and extracts package names, stripping flags and version specifiers.
 
 ```bash
@@ -152,9 +177,8 @@ echo '{"tool_name":"Write","tool_input":{"file_path":"app.py","content":"import 
 ## Known Limitations
 
 - Doesn't parse `requirements.txt`, `package.json`, `go.mod` inline (skips `-r requirements.txt`)
-- No comment-aware parsing (could false-positive on commented imports)
-- Go paths match last segment only
-- No dynamic package specs
+- Go paths match last segment only (intentional—blocks `github.com/user/moment` when `moment` is banned)
+- No dynamic package specs (can't analyze `pip install $(cat pkg.txt)`)
 
 ## License
 
