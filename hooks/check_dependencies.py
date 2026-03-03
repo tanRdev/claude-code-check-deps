@@ -13,6 +13,7 @@ Exit codes:
 
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -20,31 +21,13 @@ from pathlib import Path
 # Install command detection
 # ---------------------------------------------------------------------------
 
-INSTALL_CMD_RE = re.compile(
-    r"(?:sudo\s+)?"
-    r"(?:"
-    r"(?:npm|npx)\s+(?:install|i|add)"
-    r"|yarn\s+(?:add|install)"
-    r"|pnpm\s+(?:add|install|i)"
-    r"|bun\s+(?:add|install|i)"
-    r"|pip3?\s+install"
-    r"|pipx?\s+install"
-    r"|uv\s+(?:pip\s+install|add)"
-    r"|poetry\s+add"
-    r"|go\s+(?:get|install)"
-    r"|cargo\s+add"
-    r"|gem\s+install"
-    r"|composer\s+require"
-    r")"
-    r"\s+(.*)",
-)
-
-CMD_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
+CMD_OPS = {"&&", "||", ";", "|"}
 
 # Normalise package name from version/extras specifiers
 NPM_PKG_RE = re.compile(r"^(@[^@/]+/[^@/]+|[^@/]+)(?:@.*)?$")
 PIP_PKG_RE = re.compile(r"^([a-zA-Z0-9][-a-zA-Z0-9_.]*[a-zA-Z0-9])(?:\[.*?\])?(?:[><=!~;].*)?$")
 GO_PKG_RE = re.compile(r"^(.+?)(?:@.*)?$")
+PIP_SEP_RE = re.compile(r"[-_.]+")
 
 # Flags that consume the next token (skip both flag and value)
 PIP_SKIP_NEXT = {"-r", "--requirement", "-c", "--constraint", "-e", "--editable",
@@ -98,7 +81,9 @@ def _normalise_pip(token: str) -> str | None:
     if token in (".", "-e", "--editable"):
         return None
     m = PIP_PKG_RE.match(token)
-    return m.group(1).lower().replace("-", "-") if m else None
+    if not m:
+        return None
+    return PIP_SEP_RE.sub("-", m.group(1).lower())
 
 
 def _normalise_go(token: str) -> list[str]:
@@ -113,32 +98,105 @@ def _normalise_go(token: str) -> list[str]:
     return names
 
 
-def _detect_manager(segment: str) -> str:
-    s = segment.lstrip()
-    if s.startswith(("pip", "uv", "poetry", "pipx")):
-        return "pip"
-    if s.startswith("go"):
-        return "go"
-    return "npm"
+def _split_command_segments(command: str) -> list[str]:
+    lexer = shlex.shlex(command, posix=True, punctuation_chars="|;&")
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+
+    segments: list[str] = []
+    current: list[str] = []
+    for tok in tokens:
+        if tok in CMD_OPS:
+            if current:
+                segments.append(" ".join(current).strip())
+                current = []
+            continue
+        current.append(tok)
+    if current:
+        segments.append(" ".join(current).strip())
+    return segments
+
+
+def _strip_env_prefix(tokens: list[str]) -> list[str]:
+    i = 0
+    while i < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", tokens[i]):
+        i += 1
+    return tokens[i:]
+
+
+def _strip_sudo_prefix(tokens: list[str]) -> list[str]:
+    if not tokens or tokens[0] != "sudo":
+        return tokens
+    i = 1
+    while i < len(tokens) and tokens[i].startswith("-"):
+        i += 1
+    return tokens[i:]
+
+
+def _basename(token: str) -> str:
+    return Path(token).name
+
+
+def _parse_install_invocation(tokens: list[str]) -> tuple[str, list[str]] | None:
+    if not tokens:
+        return None
+
+    cmd = _basename(tokens[0])
+    rest = tokens[1:]
+
+    if cmd in {"npm", "npx"} and rest and rest[0] in {"install", "i", "add"}:
+        return "npm", rest[1:]
+    if cmd == "yarn" and rest and rest[0] in {"add", "install"}:
+        return "npm", rest[1:]
+    if cmd == "pnpm" and rest and rest[0] in {"add", "install", "i"}:
+        return "npm", rest[1:]
+    if cmd == "bun" and rest and rest[0] in {"add", "install", "i"}:
+        return "npm", rest[1:]
+
+    if cmd in {"pip", "pip3", "pipx"} and rest and rest[0] == "install":
+        return "pip", rest[1:]
+    if cmd == "uv" and rest:
+        if rest[0] == "add":
+            return "pip", rest[1:]
+        if len(rest) >= 2 and rest[0] == "pip" and rest[1] == "install":
+            return "pip", rest[2:]
+    if cmd == "poetry" and rest and rest[0] == "add":
+        return "pip", rest[1:]
+    if cmd.startswith("python") and len(rest) >= 3 and rest[0] == "-m" and rest[1] == "pip" and rest[2] == "install":
+        return "pip", rest[3:]
+
+    if cmd == "go" and rest and rest[0] in {"get", "install"}:
+        return "go", rest[1:]
+    if cmd == "cargo" and rest and rest[0] == "add":
+        return "npm", rest[1:]
+    if cmd == "gem" and rest and rest[0] == "install":
+        return "npm", rest[1:]
+    if cmd == "composer" and rest and rest[0] == "require":
+        return "npm", rest[1:]
+
+    return None
 
 
 def extract_packages_from_command(command: str) -> list[str]:
     packages: list[str] = []
-    segments = CMD_SPLIT_RE.split(command)
+    segments = _split_command_segments(command)
     for segment in segments:
-        segment = segment.strip()
-        # Strip env var prefixes like "FOO=bar cmd"
-        while re.match(r"^[A-Z_]+=\S+\s+", segment):
-            segment = re.sub(r"^[A-Z_]+=\S+\s+", "", segment)
-        match = INSTALL_CMD_RE.match(segment)
-        if not match:
+        if not segment:
             continue
-        args_str = match.group(1).strip()
-        manager = _detect_manager(segment)
-        tokens = args_str.split()
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            continue
+
+        tokens = _strip_sudo_prefix(_strip_env_prefix(tokens))
+        invocation = _parse_install_invocation(tokens)
+        if not invocation:
+            continue
+
+        manager, args = invocation
 
         skip_next = False
-        for tok in tokens:
+        for tok in args:
             if skip_next:
                 skip_next = False
                 continue
@@ -161,17 +219,26 @@ def extract_packages_from_command(command: str) -> list[str]:
     return packages
 
 
+def _strip_python_comments(content: str) -> str:
+    return re.sub(r"(?m)^\s*#.*$", "", content)
+
+
+def _strip_c_style_comments(content: str) -> str:
+    content = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
+    return re.sub(r"(?m)^\s*//.*$", "", content)
+
+
 def extract_packages_from_content(content: str, file_path: str) -> list[str]:
     ext = Path(file_path).suffix.lower()
     packages: list[str] = []
 
     if ext == ".py":
-        for m in PY_IMPORT_RE.finditer(content):
+        for m in PY_IMPORT_RE.finditer(_strip_python_comments(content)):
             name = (m.group(1) or m.group(2)).lower()
             packages.append(name)
 
     elif ext in JS_EXTENSIONS:
-        for m in JS_IMPORT_RE.finditer(content):
+        for m in JS_IMPORT_RE.finditer(_strip_c_style_comments(content)):
             raw = m.group(1) or m.group(2) or m.group(3)
             # @scope/pkg/subpath -> @scope/pkg
             if raw.startswith("@"):
@@ -182,9 +249,10 @@ def extract_packages_from_content(content: str, file_path: str) -> list[str]:
             packages.append(name)
 
     elif ext == ".go":
-        for m in GO_SINGLE_IMPORT_RE.finditer(content):
+        content_wo_comments = _strip_c_style_comments(content)
+        for m in GO_SINGLE_IMPORT_RE.finditer(content_wo_comments):
             packages.extend(_normalise_go(m.group(1)))
-        for block in GO_BLOCK_IMPORT_RE.finditer(content):
+        for block in GO_BLOCK_IMPORT_RE.finditer(content_wo_comments):
             for m in GO_QUOTED_RE.finditer(block.group(1)):
                 packages.extend(_normalise_go(m.group(1)))
 
