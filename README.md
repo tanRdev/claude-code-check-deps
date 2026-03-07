@@ -1,10 +1,53 @@
+<div align="center">
+
+<img src="icon.png" width="96" alt="check-deps logo">
+
 # check-deps
 
-Claude Code PreToolUse hook that blocks prohibited dependencies before they hit your codebase. Intercepts `npm install`, `pip install`, `yarn add`, `go get`, etc., plus imports in Python/JS/TS/Go files.
+Claude Code PreToolUse hook that blocks prohibited dependencies before they hit your codebase. Intercepts package install commands and file imports to enforce dependency policies defined in `compliance_rules.json`.
 
-## Installation
+[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 
-Copy these files to your project:
+⭐ If you like this project, star it on GitHub!
+
+[Overview](#overview) • [Features](#features) • [Quick Start](#quick-start) • [How It Works](#how-it-works) • [Testing](#testing)
+
+</div>
+
+## Overview
+
+`check-deps` is a security guard for your project's dependency ecosystem. It integrates with Claude Code as a PreToolUse hook to intercept:
+
+- **Package install commands**: `npm install`, `pip install`, `yarn add`, `go get`, etc.
+- **File imports**: Python `import`, JavaScript/TypeScript `require()`/`import`, Go imports
+
+When a blocked package is detected, the tool execution is blocked with a clear remediation message.
+
+> [!TIP]
+> This hook runs **before** tools execute, catching policy violations at the source rather than during CI builds or runtime.
+
+## Features
+
+- **13 package managers**: npm, yarn, pnpm, bun, pip, uv, poetry, go, cargo, gem, composer
+- **Multi-language import detection**: Python, JavaScript, TypeScript, Go
+- **Smart parsing**: Version specifiers, scoped packages (`@scope/pkg`), flags, sudo/env prefixes, command chains
+- **Config-driven**: Edit `compliance_rules.json`, no code changes needed
+- **Fail-open design**: Missing or malformed config doesn't block; warnings to stderr
+- **Zero dependencies**: Python stdlib only, Python 3.10+
+
+## Quick Start
+
+### 1. Install the hook
+
+Clone the repository and copy the required files to your project:
+
+```bash
+git clone https://github.com/tanRdev/claude-code-check-deps.git
+```
+
+Copy the three required files to your project:
+
+Required file structure:
 
 ```
 your-project/
@@ -15,18 +58,9 @@ your-project/
     └── check_dependencies.py
 ```
 
-Get them from GitHub:
+### 2. Configure the hook
 
-```bash
-git clone https://github.com/tanRdev/check-deps.git
-# Copy the three files above to your project
-```
-
-Or use the prompt below with your LLM/CLI tool.
-
-## Quick Start
-
-**1. Add hook wiring** to `.claude/settings.json`:
+Add the hook wiring to `.claude/settings.json`:
 
 ```json
 {
@@ -46,56 +80,32 @@ Or use the prompt below with your LLM/CLI tool.
 }
 ```
 
-**2. Configure blocked packages** in `compliance_rules.json`:
+### 3. Define blocked packages
+
+Configure `compliance_rules.json` with packages to block:
 
 ```json
 {
   "blocked_packages": {
-    "moment": "Use date-fns instead",
-    "requests": "Use httpx instead",
-    "lodash": "Use native ES or lodash-es"
+    "moment": "Use date-fns instead (smaller, immutable, tree-shakeable)",
+    "requests": "Use httpx instead (async support, HTTP/2)",
+    "lodash": "Use native ES methods or lodash-es for tree-shaking",
+    "urllib3": "Use httpx instead"
   }
 }
 ```
 
-**3. Reload Claude Code.** Done.
+### 4. Reload Claude Code
 
-When blocked packages are detected:
+That's it. When blocked packages are detected:
 
 ```
 Policy Violation: Blocked dependencies detected
 
-  ✗ "moment": Use date-fns instead
-  ✗ "requests": Use httpx instead
+  ✗ "moment": Use date-fns instead (smaller, immutable, tree-shakeable)
+  ✗ "requests": Use httpx instead (async support, HTTP/2)
 
 Remove or replace the blocked packages to proceed.
-```
-
-## Installation Prompt
-
-Copy and paste this into your LLM/agentic CLI to install the hook:
-
-```
-Install the check-deps Claude Code hook into my project.
-
-1. Create the file structure:
-   - .claude/settings.json (PreToolUse hook configuration)
-   - compliance_rules.json (blocked packages config)
-   - hooks/check_dependencies.py (the hook script)
-
-2. For .claude/settings.json: Wire up the PreToolUse hook to match "Bash|Write|Edit" and run "python3 hooks/check_dependencies.py"
-
-3. For compliance_rules.json: Start with blocked_packages for "moment" (use date-fns), "requests" (use httpx), "lodash" (use native or lodash-es), and "urllib3" (use httpx)
-
-4. For hooks/check_dependencies.py: A Python3 hook that intercepts package installs and imports. It supports:
-   - 13 package managers (npm, yarn, pnpm, bun, pip, uv, poetry, go, cargo, gem, composer)
-   - Import detection in Python, JS/TS, Go
-   - Version specifiers (moment@2.29.4, requests>=2.28)
-   - Chained commands (npm install foo && pip install bar)
-   - Sudo and env var prefixes
-   - Relative imports are always allowed
-
-The script should read JSON from stdin with tool_name and tool_input, extract packages, check against compliance_rules.json, and exit with code 0 (allow), 2 (block with error), or 1 (internal error).
 ```
 
 ## How It Works
@@ -118,50 +128,51 @@ flowchart TB
     G --> I{Check against<br/>compliance_rules.json}
     H --> I
     
-    I -->|No violations| J["Exit 0<br/>✓ Allow"]
-    I -->|Violations found| K["Exit 2<br/>✗ Block + advice"]
+    I -->|No violations| J["Exit 0<br/>Allow"]
+    I -->|Violations found| K["Exit 2<br/>Block + advice"]
     
     J --> L[Tool executes]
     K --> M[Tool blocked]
 ```
 
-**Bash commands**: Splits on `&&`, `||`, `;`, `|`. Detects install managers and extracts package names, stripping flags and version specifiers.
+### Command Parsing
+
+The hook splits commands on `&&`, `||`, `;`, `|` to detect install commands across chains:
 
 ```bash
-npm install moment@2.29.4 --save  # Detects "moment"
-sudo pip install requests         # Detects "requests"
-npm install foo && pip install bar  # Detects both
+npm install moment@2.29.4 --save    # Detects: moment
+sudo pip install requests            # Detects: requests
+npm install foo && pip install bar   # Detects: foo, bar
 ```
 
-**File writes**: Scans imports by file extension.
+### Import Detection
 
+**Python:**
 ```python
-import requests            # Blocked
-from requests import get   # Blocked (top-level package)
+import requests              # Blocked
+from requests import get    # Blocked (top-level package)
+from .local import utils    # Allowed (relative import)
 ```
 
+**JavaScript/TypeScript:**
 ```javascript
 import moment from 'moment'   // Blocked
 require('moment')             // Blocked
-import('moment')              // Blocked
+import('./utils')             // Allowed (relative)
 ```
 
+**Go:**
 ```go
-import "github.com/user/moment"  // Blocked
+import "github.com/user/moment"  // Blocked (matches "moment")
+import "./utils"                  // Allowed (relative)
 ```
 
-Relative imports (`./foo`, `../bar`) are always allowed.
-
-## Features
-
-- **13 package managers**: npm, yarn, pnpm, bun, pip, uv, poetry, go, cargo, gem, composer
-- **Multi-language**: Python, JS/TS, Go imports
-- **Smart parsing**: Version specifiers, scoped packages, flags, sudo/env prefixes, command chains
-- **Config-driven**: Edit `compliance_rules.json`, no code changes
-- **Fail-open**: Missing/malformed config doesn't block; warnings to stderr
-- **Zero deps**: Stdlib only, Python 3.10+
+> [!NOTE]
+> Relative imports (`./foo`, `../bar`) are always allowed.
 
 ## Testing
+
+Test the hook manually:
 
 ```bash
 # Block (exit 2)
@@ -170,16 +181,44 @@ echo '{"tool_name":"Bash","tool_input":{"command":"npm install moment"}}' | pyth
 # Allow (exit 0)
 echo '{"tool_name":"Bash","tool_input":{"command":"npm install date-fns"}}' | python3 hooks/check_dependencies.py
 
-# Block imports
+# Block Python imports
 echo '{"tool_name":"Write","tool_input":{"file_path":"app.py","content":"import requests"}}' | python3 hooks/check_dependencies.py
+
+# Block JavaScript imports
+echo '{"tool_name":"Edit","tool_input":{"file_path":"app.ts","new_string":"import moment from '\''moment'\''"}}' | python3 hooks/check_dependencies.py
+```
+
+Run the test suite:
+
+```bash
+python -m pytest tests/
+```
+
+## Project Structure
+
+```
+.
+├── hooks/
+│   └── check_dependencies.py    # Main hook implementation
+├── tests/
+│   └── test_check_dependencies.py  # Unit tests
+├── compliance_rules.json        # Blocked packages configuration
+├── LICENSE                      # MIT License
+└── README.md                    # This file
 ```
 
 ## Known Limitations
 
-- Doesn't parse `requirements.txt`, `package.json`, `go.mod` inline (skips `-r requirements.txt`)
-- Go paths match last segment only (intentional—blocks `github.com/user/moment` when `moment` is banned)
-- No dynamic package specs (can't analyze `pip install $(cat pkg.txt)`)
+- Does not parse `requirements.txt`, `package.json`, `go.mod` inline references (skips `-r requirements.txt`)
+- Go path matching uses last segment only (intentional — blocks `github.com/user/moment` when `moment` is banned)
+- Cannot analyze dynamic package specs (e.g., `pip install $(cat pkg.txt)`)
+
+## Related
+
+- [Claude Code Hooks Documentation](https://docs.anthropic.com/en/docs/claude-code/hooks)
+- [compliance_rules.json schema](./compliance_rules.json)
+- [Hook source code](./hooks/check_dependencies.py)
 
 ## License
 
-MIT
+MIT License — see [LICENSE](./LICENSE) for details.
