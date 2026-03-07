@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="icon.png" width="96" alt="check-deps logo">
-
 # check-deps
 
 Claude Code PreToolUse hook that blocks prohibited dependencies before they hit your codebase. Intercepts package install commands and file imports to enforce dependency policies defined in `compliance_rules.json`.
