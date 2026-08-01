@@ -189,7 +189,7 @@ echo '{"tool_name":"Edit","tool_input":{"file_path":"app.ts","new_string":"impor
 Run the test suite:
 
 ```bash
-python -m pytest tests/
+python3 -m unittest discover -s tests -p 'test*.py'
 ```
 
 ## Project Structure
