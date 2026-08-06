@@ -26,7 +26,7 @@ When a blocked package is detected, the tool execution is blocked with a clear r
 
 ## Features
 
-- **13 package managers**: npm, yarn, pnpm, bun, pip, uv, poetry, go, cargo, gem, composer
+- **11 package managers**: npm, yarn, pnpm, bun, pip, uv, poetry, go, cargo, gem, composer
 - **Multi-language import detection**: Python, JavaScript, TypeScript, Go
 - **Smart parsing**: Version specifiers, scoped packages (`@scope/pkg`), flags, sudo/env prefixes, command chains
 - **Config-driven**: Edit `compliance_rules.json`, no code changes needed

@@ -23,16 +23,38 @@ from pathlib import Path
 
 CMD_OPS = {"&&", "||", ";", "|"}
 
+# Executables that install or run third-party packages. Used to fail closed
+# when a command segment mentions one but cannot be parsed.
+PM_NAME_RE = re.compile(
+    r"\b(?:npm|npx|yarn|pnpm|bun|bunx|pip3?|pipx|uv|uvx|poetry"
+    r"|go|cargo|gem|composer)\b")
+
 # Normalise package name from version/extras specifiers
 NPM_PKG_RE = re.compile(r"^(@[^@/]+/[^@/]+|[^@/]+)(?:@.*)?$")
 PIP_PKG_RE = re.compile(r"^([a-zA-Z0-9][-a-zA-Z0-9_.]*[a-zA-Z0-9])(?:\[.*?\])?(?:[><=!~;].*)?$")
 GO_PKG_RE = re.compile(r"^(.+?)(?:@.*)?$")
 PIP_SEP_RE = re.compile(r"[-_.]+")
+COMPOSER_PKG_RE = re.compile(r"^([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)(?:[:@].*)?$")
+
+# URL / VCS install specs (pip git+https://..., npm github:user/repo, ...)
+VCS_SCHEME_RE = re.compile(r"^(?:git|hg|svn|bzr)\+", re.IGNORECASE)
+URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+HOST_SHORTHAND_RE = re.compile(r"^(?:github|gitlab|bitbucket|gist):", re.IGNORECASE)
+USER_REPO_RE = re.compile(r"^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+(?:[#@].*)?$")
+EGG_FRAGMENT_RE = re.compile(r"[#&]egg=([A-Za-z0-9._-]+)")
+PEP508_DIRECT_RE = re.compile(r"^\s*([A-Za-z0-9._-]+)\s+@\s+\S")
+ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tgz", ".tar", ".zip", ".whl")
+VERSION_SUFFIX_RE = re.compile(r"-v?\d+(?:\.\d+)*(?:[-+][A-Za-z0-9.]+)?$")
 
 # Flags that consume the next token (skip both flag and value)
-PIP_SKIP_NEXT = {"-r", "--requirement", "-c", "--constraint", "-e", "--editable",
+PIP_SKIP_NEXT = {"-r", "--requirement", "-c", "--constraint",
                  "-f", "--find-links", "-i", "--index-url", "--extra-index-url",
-                 "--target", "-t"}
+                 "--target", "-t", "--spec"}
+
+# Editable installs: the next token is a local path (allowed) or a VCS/URL
+# target that must be checked like any other URL install.
+PIP_EDITABLE = {"-e", "--editable"}
+NPM_SKIP_NEXT = {"-p", "--package", "-c", "--call"}
 
 # ---------------------------------------------------------------------------
 # Import detection patterns
@@ -91,11 +113,65 @@ def _normalise_go(token: str) -> list[str]:
     if not m:
         return []
     path = m.group(1)
+    if path.startswith("."):
+        return []  # relative imports (./foo, ../bar) are always allowed
     parts = path.rstrip("/").split("/")
     names = [parts[-1].lower()]
     if len(parts) > 1:
         names.append(path.lower())
     return names
+
+
+def _normalise_composer(token: str) -> list[str]:
+    m = COMPOSER_PKG_RE.match(token)
+    if not m:
+        return []
+    name = m.group(1).lower()
+    parts = name.split("/")
+    names = [parts[-1]]
+    if len(parts) > 1:
+        names.append(name)
+    return names
+
+
+def _is_urlish(token: str) -> bool:
+    return bool(
+        VCS_SCHEME_RE.match(token)
+        or URL_SCHEME_RE.match(token)
+        or HOST_SHORTHAND_RE.match(token)
+        or USER_REPO_RE.match(token)
+        or (PEP508_DIRECT_RE.match(token) and ("://" in token or "git+" in token))
+    )
+
+
+def _name_from_urlish(token: str) -> str | None:
+    t = token.strip()
+    m = EGG_FRAGMENT_RE.search(t)
+    if m:
+        return m.group(1).lower()
+    m = PEP508_DIRECT_RE.match(t)
+    if m:
+        return m.group(1).lower()
+    t = VCS_SCHEME_RE.sub("", t)
+    t = HOST_SHORTHAND_RE.sub("", t)
+    t = t.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    if "://" in t:
+        t = t.split("://", 1)[1]
+    segments = [s for s in t.split("/") if s]
+    if not segments:
+        return None
+    if (URL_SCHEME_RE.match(token) or VCS_SCHEME_RE.match(token)) and len(segments) < 2:
+        return None  # bare host with no path, identity unknowable
+    last = segments[-1]
+    if last.endswith(".git"):
+        last = last[:-4]
+    lower = last.lower()
+    for suffix in ARCHIVE_SUFFIXES:
+        if lower.endswith(suffix):
+            last = last[: -len(suffix)]
+            break
+    last = VERSION_SUFFIX_RE.sub("", last)
+    return last.lower() or None
 
 
 def _split_command_segments(command: str) -> list[str]:
@@ -156,12 +232,28 @@ def _parse_install_invocation(tokens: list[str]) -> tuple[str, list[str]] | None
     if cmd == "bun" and rest and rest[0] in {"add", "install", "i"}:
         return "npm", rest[1:]
 
+    # Execute-without-install runners: npx <pkg>, bunx <pkg>, pnpm dlx <pkg>...
+    if cmd in {"npx", "bunx"} and rest:
+        return "npm", rest
+    if cmd == "npm" and rest and rest[0] == "exec":
+        return "npm", rest[1:]
+    if cmd == "bun" and rest and rest[0] == "x":
+        return "npm", rest[1:]
+    if cmd in {"pnpm", "yarn"} and rest and rest[0] == "dlx":
+        return "npm", rest[1:]
+
     if cmd in {"pip", "pip3", "pipx"} and rest and rest[0] == "install":
         return "pip", rest[1:]
+    if cmd == "pipx" and rest and rest[0] == "run":
+        return "pip", rest[1:]
+    if cmd == "uvx" and rest:
+        return "pip", rest
     if cmd == "uv" and rest:
         if rest[0] == "add":
             return "pip", rest[1:]
         if len(rest) >= 2 and rest[0] == "pip" and rest[1] == "install":
+            return "pip", rest[2:]
+        if len(rest) >= 2 and rest[0] == "tool" and rest[1] == "run":
             return "pip", rest[2:]
     if cmd == "poetry" and rest and rest[0] == "add":
         return "pip", rest[1:]
@@ -174,14 +266,24 @@ def _parse_install_invocation(tokens: list[str]) -> tuple[str, list[str]] | None
         return "npm", rest[1:]
     if cmd == "gem" and rest and rest[0] == "install":
         return "npm", rest[1:]
-    if cmd == "composer" and rest and rest[0] == "require":
-        return "npm", rest[1:]
+    if cmd == "composer" and rest:
+        if rest[0] == "require":
+            return "composer", rest[1:]
+        if len(rest) >= 2 and rest[0] == "global" and rest[1] == "require":
+            return "composer", rest[2:]
 
     return None
 
 
-def extract_packages_from_command(command: str) -> list[str]:
+def analyze_command(command: str) -> tuple[list[str], list[str]]:
+    """Extract package identities from a shell command.
+
+    Returns (package names, conservative block reasons). Reasons are
+    produced when a package operation is detected but its identity
+    cannot be determined (unparseable command, opaque URL install).
+    """
     packages: list[str] = []
+    reasons: list[str] = []
     segments = _split_command_segments(command)
     for segment in segments:
         if not segment:
@@ -189,6 +291,9 @@ def extract_packages_from_command(command: str) -> list[str]:
         try:
             tokens = shlex.split(segment, posix=True)
         except ValueError:
+            if PM_NAME_RE.search(segment):
+                reasons.append(
+                    f"unable to parse package manager command: {segment!r}")
             continue
 
         tokens = _strip_sudo_prefix(_strip_env_prefix(tokens))
@@ -199,13 +304,42 @@ def extract_packages_from_command(command: str) -> list[str]:
         manager, args = invocation
 
         skip_next = False
+        editable_next = False
         for tok in args:
+            if editable_next:
+                editable_next = False
+                if _is_urlish(tok):
+                    name = _name_from_urlish(tok)
+                    if name:
+                        packages.append(PIP_SEP_RE.sub("-", name))
+                    else:
+                        reasons.append(
+                            f"unable to determine package identity from '{tok}'")
+                continue
             if skip_next:
                 skip_next = False
                 continue
             if tok.startswith("-"):
-                if manager == "pip" and tok in PIP_SKIP_NEXT:
-                    skip_next = True
+                if manager == "pip" and tok in PIP_EDITABLE:
+                    editable_next = True
+                    continue
+                if manager == "pip" and tok.startswith("--editable="):
+                    tok = tok.split("=", 1)[1]
+                else:
+                    if manager == "pip" and tok in PIP_SKIP_NEXT:
+                        skip_next = True
+                    if manager == "npm" and tok in NPM_SKIP_NEXT:
+                        skip_next = True
+                    continue
+
+            if manager in ("npm", "pip") and _is_urlish(tok):
+                name = _name_from_urlish(tok)
+                if name:
+                    packages.append(
+                        PIP_SEP_RE.sub("-", name) if manager == "pip" else name)
+                else:
+                    reasons.append(
+                        f"unable to determine package identity from '{tok}'")
                 continue
 
             if manager == "npm":
@@ -218,17 +352,27 @@ def extract_packages_from_command(command: str) -> list[str]:
                     packages.append(name)
             elif manager == "go":
                 packages.extend(_normalise_go(tok))
+            elif manager == "composer":
+                packages.extend(_normalise_composer(tok))
 
+    return packages, reasons
+
+
+def extract_packages_from_command(command: str) -> list[str]:
+    packages, _ = analyze_command(command)
     return packages
 
 
 def _strip_python_comments(content: str) -> str:
+    content = re.sub(r'"""[\s\S]*?"""', "", content)
+    content = re.sub(r"'''[\s\S]*?'''", "", content)
     return re.sub(r"(?m)^\s*#.*$", "", content)
 
 
 def _strip_c_style_comments(content: str) -> str:
     content = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
-    return re.sub(r"(?m)^\s*//.*$", "", content)
+    # (?<!:) keeps URL strings like 'https://...' intact
+    return re.sub(r"(?m)(?<!:)//.*$", "", content)
 
 
 def extract_packages_from_content(content: str, file_path: str) -> list[str]:
@@ -284,6 +428,15 @@ def format_violation_message(violations: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def format_unverifiable_message(reasons: list[str]) -> str:
+    lines = ["", "Policy Violation: Unverifiable package operations detected", ""]
+    for reason in reasons:
+        lines.append(f"  ✗ {reason}")
+    lines.append("")
+    lines.append("Package operations that cannot be verified against policy are blocked.")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -302,11 +455,12 @@ def main() -> None:
     tool_name = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
     packages: list[str] = []
+    reasons: list[str] = []
 
     if tool_name == "Bash":
         command = tool_input.get("command", "")
         if command:
-            packages = extract_packages_from_command(command)
+            packages, reasons = analyze_command(command)
 
     elif tool_name in ("Write", "Edit"):
         file_path = tool_input.get("file_path", "")
@@ -316,15 +470,16 @@ def main() -> None:
     else:
         sys.exit(0)
 
-    if not packages:
-        sys.exit(0)
-
     violations = check_violations(packages, rules)
-    if not violations:
-        sys.exit(0)
+    if violations:
+        print(format_violation_message(violations), file=sys.stderr)
+        sys.exit(2)
 
-    print(format_violation_message(violations), file=sys.stderr)
-    sys.exit(2)
+    if reasons:
+        print(format_unverifiable_message(reasons), file=sys.stderr)
+        sys.exit(2)
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":
